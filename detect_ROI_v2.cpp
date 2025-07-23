@@ -14,7 +14,7 @@
 #include <unistd.h>
 #include <string.h>
 #include <errno.h>
-
+#include "tcp_server.h"
 #include "detection_controller.h"
 
 // --- 전역 변수 선언 ---
@@ -31,6 +31,9 @@ bool g_servoEnabled = true;
 
 // Detection Controller
 std::unique_ptr<DetectionController> g_detectionController;
+
+// TCP 서버 객체
+TCPServer g_tcpServer;
 
 // 성능 최적화를 위한 변수
 const int CAPTURE_WIDTH = 320;   
@@ -354,6 +357,28 @@ int main() {
     
     g_detectionController = std::make_unique<DetectionController>(config);
     g_detectionController->setEventHandler(detectionEventHandler);
+
+    // ================== TCP 서버 설정 시작 ==================
+    g_tcpServer.setOnMessageReceived([&](const std::string& message) {
+        std::cout << "[TCP Received] " << message << std::endl;
+        
+        // 수신된 명령어를 Detection Controller로 전달
+        // 기존 터미널 입력 처리와 동일한 로직을 사용합니다.
+        if (g_detectionController->processCommand(message)) {
+            // команда 처리 성공
+        } else {
+            // 숫자나 다른 명령어가 들어올 경우의 처리 (필요 시 추가)
+            std::cout << "[TCP] Unknown command: " << message << std::endl;
+        }
+    });
+
+    int tcp_port = 8080; // 사용할 포트 번호
+    if (!g_tcpServer.start(tcp_port)) {
+        std::cerr << "치명적 오류: TCP 서버를 시작할 수 없습니다. 포트 " << tcp_port << "가 사용 중인지 확인하세요." << std::endl;
+    } else {
+        std::cout << "TCP 서버가 포트 " << tcp_port << "에서 시작되었습니다." << std::endl;
+    }
+    // ================== TCP 서버 설정 종료 ==================
     
     // 서보 디바이스 연결
     if (!openServoDevice()) {
@@ -580,6 +605,10 @@ int main() {
     std::cout << "총 감지 횟수: " << stats.totalDetections << std::endl;
     std::cout << "서보 동작 횟수: " << stats.servoActions << std::endl;
     std::cout << "==================" << std::endl;
+
+    // TCP 서버 중지
+    g_tcpServer.stop(); 
+    std::cout << "TCP 서버가 중지되었습니다." << std::endl;
     
     // 서보 디바이스 닫기
     closeServoDevice();
