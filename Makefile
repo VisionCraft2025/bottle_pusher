@@ -5,6 +5,10 @@ CXX := g++
 CXXFLAGS := -std=c++17 -Wall -Wextra -O2 -g
 LDFLAGS := -pthread
 
+# GStreamer 설정
+GST_CFLAGS := $(shell pkg-config --cflags gstreamer-1.0 gstreamer-rtsp-server-1.0 gstreamer-app-1.0)
+GST_LIBS := $(shell pkg-config --libs gstreamer-1.0 gstreamer-rtsp-server-1.0 gstreamer-app-1.0)
+
 # OpenCV 설정
 OPENCV_FLAGS := $(shell pkg-config --cflags opencv4)
 OPENCV_LIBS := $(shell pkg-config --libs opencv4)
@@ -52,12 +56,12 @@ $(TCP_SERVER_OBJ): $(TCP_SERVER_SRC) tcp_server.h
 # 메인 프로그램 컴파일
 $(MAIN_OBJ): $(MAIN_SRC) detection_controller.h tcp_server.h
 	@echo "$(BLUE)Compiling main program...$(NC)"
-	$(CXX) $(CXXFLAGS) $(OPENCV_FLAGS) -c $(MAIN_SRC) -o $(MAIN_OBJ)
+	$(CXX) $(CXXFLAGS) $(OPENCV_FLAGS) $(GST_CFLAGS) -c $(MAIN_SRC) -o $(MAIN_OBJ)
 
 # 링킹
 $(TARGET): $(CONTROLLER_OBJ) $(MAIN_OBJ) $(TCP_SERVER_OBJ) # <--- 오브젝트 목록에 TCP 서버 추가
 	@echo "$(BLUE)Linking...$(NC)"
-	$(CXX) $(CONTROLLER_OBJ) $(MAIN_OBJ) $(TCP_SERVER_OBJ) -o $(TARGET) $(LDFLAGS) $(OPENCV_LIBS)
+	$(CXX) $(CONTROLLER_OBJ) $(MAIN_OBJ) $(TCP_SERVER_OBJ) -o $(TARGET) $(LDFLAGS) $(OPENCV_LIBS) $(GST_LIBS)
 
 # 클라이언트 컴파일 타겟   <--- 클라이언트 컴파일 규칙 추가
 client: $(CLIENT_SRC) tcp_client.h

@@ -14,6 +14,10 @@
 #include <unistd.h>
 #include <string.h>
 #include <errno.h>
+#include <gst/gst.h>
+#include <gst/rtsp-server/rtsp-server.h>
+#include <gst/app/gstappsrc.h>
+
 #include "tcp_server.h"
 #include "detection_controller.h"
 
@@ -35,6 +39,13 @@ std::unique_ptr<DetectionController> g_detectionController;
 // TCP 서버 객체
 TCPServer g_tcpServer;
 
+// RTSP 서버 관련 전역 변수
+static GstElement *process3_appsrc = nullptr;
+static GMainLoop *g_rtspLoop = nullptr;
+std::atomic<bool> g_rtspRunning(false);
+std::mutex g_rtspMutex;
+cv::Mat g_rtspFrame;
+
 // 성능 최적화를 위한 변수
 const int CAPTURE_WIDTH = 320;
 const int CAPTURE_HEIGHT = 240;
@@ -44,9 +55,6 @@ const int BLUR_SIZE = 5;
 // SAD 감지 관련
 cv::Mat g_prevFrame;
 cv::Mat g_baselineFrame;
-// const int DEBOUNCE_FRAMES = 15;
-// int g_framesSinceDetection = 0;
-// bool g_isBottlePresent = false;
 
 // 통계 및 성능 측정
 double g_currentSAD = 0.0;
@@ -60,9 +68,225 @@ int g_frameCounter = 0;
 std::atomic<bool> g_shouldExit(false);
 cv::VideoCapture *g_cap = nullptr;
 
+// --- 함수 선언 ---
+void inputHandler();
+void captureBaseline();
+double calculateFastSAD(const cv::Mat &current, const cv::Mat &previous, const cv::Mat &mask);
+void updateFPS();
+void setupROIFromCoordinates(); // 새로운 함수 추가
+
+// --- ROI 좌표 입력 함수 ---
+void setupROIFromCoordinates()
+{
+    std::cout << "\n=== ROI 좌표 입력 ===" << std::endl;
+    std::cout << "최소 3개 이상의 점을 입력하세요." << std::endl;
+    std::cout << "각 점의 x,y 좌표를 공백으로 구분하여 입력하세요." << std::endl;
+    std::cout << "입력 완료 시 'done'을 입력하세요." << std::endl;
+    std::cout << "좌표 범위: x(0-" << CAPTURE_WIDTH - 1 << "), y(0-" << CAPTURE_HEIGHT - 1 << ")" << std::endl;
+
+    g_points.clear();
+    std::string input;
+    int pointCount = 0;
+
+    while (true)
+    {
+        std::cout << "점 " << (pointCount + 1) << " (x y) 또는 'done': ";
+        std::getline(std::cin, input);
+
+        if (input == "done")
+        {
+            if (g_points.size() < 3)
+            {
+                std::cout << "최소 3개의 점이 필요합니다!" << std::endl;
+                continue;
+            }
+            break;
+        }
+
+        std::istringstream iss(input);
+        int x, y;
+        if (iss >> x >> y)
+        {
+            if (x >= 0 && x < CAPTURE_WIDTH && y >= 0 && y < CAPTURE_HEIGHT)
+            {
+                g_points.push_back(cv::Point(x, y));
+                pointCount++;
+                std::cout << "점 " << pointCount << " 추가됨: (" << x << ", " << y << ")" << std::endl;
+            }
+            else
+            {
+                std::cout << "좌표가 범위를 벗어났습니다!" << std::endl;
+            }
+        }
+        else
+        {
+            std::cout << "잘못된 입력입니다. 'x y' 형식으로 입력하세요." << std::endl;
+        }
+    }
+
+    // ROI 마스크 생성
+    g_roiMask = cv::Mat::zeros(cv::Size(CAPTURE_WIDTH, CAPTURE_HEIGHT), CV_8UC1);
+    const cv::Point *pts[1] = {g_points.data()};
+    int npts[] = {(int)g_points.size()};
+    cv::fillPoly(g_roiMask, pts, npts, 1, cv::Scalar(255));
+
+    g_roiSelected = true;
+
+    std::cout << "\n=== ROI 선택 완료 ===" << std::endl;
+    std::cout << "선택된 점들: ";
+    for (const auto &pt : g_points)
+    {
+        std::cout << "(" << pt.x << "," << pt.y << ") ";
+    }
+    std::cout << std::endl;
+    std::cout << "기준 프레임 캡처: 'b'" << std::endl;
+    std::cout << "감지 제어: 'd_on' / 'd_off'" << std::endl;
+    std::cout << "========================\n"
+              << std::endl;
+
+    // Detection Controller 활성화
+    g_detectionController->enable();
+    g_detectionController->arm();
+}
+
+// --- RTSP 서버 관련 함수들 ---
+static void process3_media_configure(GstRTSPMediaFactory *factory, GstRTSPMedia *media, gpointer user_data);
+static void client_connected(GstRTSPServer *server, GstRTSPClient *client, gpointer user_data);
+
+// process3_media_configure 함수 정의
+static void process3_media_configure(GstRTSPMediaFactory *factory, GstRTSPMedia *media, gpointer user_data)
+{
+    GstElement *element = gst_rtsp_media_get_element(media);
+    process3_appsrc = gst_bin_get_by_name_recurse_up(GST_BIN(element), "process3_source");
+    std::cout << "[DEBUG] Process3 media configured, appsrc: " << (process3_appsrc != nullptr) << std::endl;
+
+    GstCaps *caps = gst_caps_new_simple("video/x-raw",
+                                        "format", G_TYPE_STRING, "I420",
+                                        "width", G_TYPE_INT, 640,
+                                        "height", G_TYPE_INT, 480,
+                                        "framerate", GST_TYPE_FRACTION, 30, 1,
+                                        NULL);
+    gst_app_src_set_caps(GST_APP_SRC(process3_appsrc), caps);
+    gst_caps_unref(caps);
+    gst_object_unref(element);
+}
+
+// 클라이언트 연결 콜백 함수
+static void client_connected(GstRTSPServer *server, GstRTSPClient *client, gpointer user_data)
+{
+    std::cout << "[RTSP] 클라이언트 연결됨" << std::endl;
+}
+
+// RTSP 스트리밍 스레드 (중복 정의 제거됨)
+void rtsp_streaming_thread()
+{
+    const int fps = 30;
+    const int delay_ms = 1000 / fps;
+    static GstClockTime timestamp = 0;
+
+    std::cout << "[RTSP] 스트리밍 스레드 시작" << std::endl;
+
+    while (g_rtspRunning)
+    {
+        if (process3_appsrc)
+        {
+            std::lock_guard<std::mutex> lock(g_rtspMutex);
+
+            // RTSP 프레임이 없으면 대기
+            if (g_rtspFrame.empty())
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+                continue;
+            }
+
+            cv::Mat process_frame;
+            cv::resize(g_rtspFrame, process_frame, cv::Size(640, 480));
+
+            // BGR to YUV_I420 변환
+            cv::Mat yuv;
+            cv::cvtColor(process_frame, yuv, cv::COLOR_BGR2YUV_I420);
+
+            int size = yuv.total() * yuv.elemSize();
+            GstBuffer *buffer = gst_buffer_new_allocate(NULL, size, NULL);
+
+            GstMapInfo map;
+            gst_buffer_map(buffer, &map, GST_MAP_WRITE);
+            memcpy(map.data, yuv.data, size);
+            gst_buffer_unmap(buffer, &map);
+
+            // 타임스탬프 설정
+            GST_BUFFER_PTS(buffer) = timestamp;
+            GST_BUFFER_DURATION(buffer) = gst_util_uint64_scale_int(1, GST_SECOND, fps);
+            timestamp += GST_BUFFER_DURATION(buffer);
+
+            GstFlowReturn ret;
+            g_signal_emit_by_name(process3_appsrc, "push-buffer", buffer, &ret);
+            gst_buffer_unref(buffer);
+
+            if (ret != GST_FLOW_OK)
+            {
+                std::cerr << "[RTSP] Buffer push failed: " << ret << std::endl;
+            }
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+    }
+
+    std::cout << "[RTSP] 스트리밍 스레드 종료" << std::endl;
+}
+
+void setup_rtsp_server()
+{
+    gst_init(nullptr, nullptr);
+
+    GstRTSPServer *server = gst_rtsp_server_new();
+    gst_rtsp_server_set_service(server, "8554");
+
+    // 주소 재사용 허용
+    g_object_set(server, "address", "0.0.0.0", NULL);
+
+    // 클라이언트 연결 이벤트 핸들러 추가
+    g_signal_connect(server, "client-connected", (GCallback)client_connected, NULL);
+
+    GstRTSPMountPoints *mounts = gst_rtsp_server_get_mount_points(server);
+
+    GstRTSPMediaFactory *process3_factory = gst_rtsp_media_factory_new();
+
+    // x264enc 파라미터 최적화
+    const gchar *process3_launch =
+        "( appsrc name=process3_source is-live=true block=false format=time do-timestamp=true ! "
+        "video/x-raw,format=I420,width=640,height=480,framerate=30/1 ! "
+        "x264enc tune=zerolatency bitrate=2000 speed-preset=superfast key-int-max=30 ! "
+        "rtph264pay name=pay0 pt=96 config-interval=1 )";
+
+    gst_rtsp_media_factory_set_launch(process3_factory, process3_launch);
+    gst_rtsp_media_factory_set_shared(process3_factory, TRUE);
+
+    // 레이턴시 감소
+    gst_rtsp_media_factory_set_latency(process3_factory, 0);
+
+    g_signal_connect(process3_factory, "media-configure", (GCallback)process3_media_configure, NULL);
+    gst_rtsp_mount_points_add_factory(mounts, "/process3", process3_factory);
+
+    g_object_unref(mounts);
+
+    guint id = gst_rtsp_server_attach(server, NULL);
+    if (id == 0)
+    {
+        std::cerr << "RTSP 서버 연결 실패" << std::endl;
+    }
+    else
+    {
+        std::cout << "RTSP 서버 시작 (ID: " << id << ")" << std::endl;
+        std::cout << "  처리된 영상: rtsp://localhost:8554/process3" << std::endl;
+        std::cout << "  외부 접속: rtsp://192.168.0.64:8554/process3" << std::endl;
+    }
+}
+
 // 시그널 핸들러
 void signalHandler(int signum)
 {
+    (void)signum; // 경고 제거
     std::cout << "\n인터럽트 신호 받음. 프로그램을 종료합니다..." << std::endl;
     g_shouldExit = true;
 }
@@ -202,6 +426,9 @@ void updateFPS();
 // --- 마우스 콜백 함수 ---
 void onMouse(int event, int x, int y, int flags, void *userdata)
 {
+    (void)flags;    // 경고 제거
+    (void)userdata; // 경고 제거
+
     if (g_roiSelected)
         return;
 
@@ -263,6 +490,13 @@ void inputHandler()
 
         if (input.empty())
             continue;
+
+        // ROI 설정 명령 추가
+        if (input == "r")
+        {
+            setupROIFromCoordinates();
+            continue;
+        }
 
         // Detection Controller 명령 처리
         if (g_detectionController->processCommand(input))
@@ -397,17 +631,32 @@ void updateFPS()
 // --- 메인 함수 ---
 int main()
 {
+    //  GStreamer 디버그 설정 추가
+    putenv((char *)"GST_DEBUG=2");
+
     // 시그널 핸들러 설정
     signal(SIGINT, signalHandler);
     signal(SIGTERM, signalHandler);
 
-    std::cout << "=== 고속 플라스틱병 감지 시스템 v4.0 (Detection Controller) ===" << std::endl;
+    std::cout << "=== 고속 플라스틱병 감지 시스템 v4.0 (Detection Controller + RTSP) ===" << std::endl;
     std::cout << "해상도: " << CAPTURE_WIDTH << "x" << CAPTURE_HEIGHT
               << " @ " << CAPTURE_FPS << "FPS" << std::endl;
 
+    // RTSP 서버 설정 및 시작
+    setup_rtsp_server();
+    g_rtspRunning = true;
+
+    // RTSP 스트리밍 스레드 시작
+    std::thread rtsp_thread(rtsp_streaming_thread);
+
+    // GStreamer 메인 루프 시작
+    g_rtspLoop = g_main_loop_new(NULL, FALSE);
+    std::thread gst_thread([&]()
+                           { g_main_loop_run(g_rtspLoop); });
+
     // Detection Controller 초기화
     DetectionConfig config;
-    config.defaultThreshold = 500000.0; // 기본 임계값 500000
+    config.defaultThreshold = 500000.0;
     config.cooldownMs = 1000;
     config.enableLogging = true;
     config.logFilePath = "/tmp/bottle_detection.log";
@@ -415,21 +664,18 @@ int main()
     g_detectionController = std::make_unique<DetectionController>(config);
     g_detectionController->setEventHandler(detectionEventHandler);
 
-    // ================== TCP 서버 설정 시작 ==================
+    // TCP 서버 설정
     g_tcpServer.setOnMessageReceived([&](const std::string &message)
                                      {
         std::cout << "[TCP Received] " << message << std::endl;
         
-        // 수신된 명령어를 Detection Controller로 전달
-        // 기존 터미널 입력 처리와 동일한 로직을 사용합니다.
         if (g_detectionController->processCommand(message)) {
-            // команда 처리 성공
+            // 명령 처리 성공
         } else {
-            // 숫자나 다른 명령어가 들어올 경우의 처리 (필요 시 추가)
             std::cout << "[TCP] Unknown command: " << message << std::endl;
         } });
 
-    int tcp_port = 8080; // 사용할 포트 번호
+    int tcp_port = 8080;
     if (!g_tcpServer.start(tcp_port))
     {
         std::cerr << "치명적 오류: TCP 서버를 시작할 수 없습니다. 포트 " << tcp_port << "가 사용 중인지 확인하세요." << std::endl;
@@ -438,7 +684,6 @@ int main()
     {
         std::cout << "TCP 서버가 포트 " << tcp_port << "에서 시작되었습니다." << std::endl;
     }
-    // ================== TCP 서버 설정 종료 ==================
 
     // 서보 디바이스 연결
     if (!openServoDevice())
@@ -448,7 +693,6 @@ int main()
     }
     else
     {
-        // 기본 서보 설정
         configureServo(180, 0, 300);
     }
 
@@ -477,23 +721,38 @@ int main()
 
     std::cout << "카메라 준비 완료!\n"
               << std::endl;
-    std::cout << "=== 사용 방법 ===" << std::endl;
-    std::cout << "1. 마우스 왼쪽 클릭: ROI 점 추가" << std::endl;
-    std::cout << "2. 마우스 오른쪽 클릭: ROI 완성" << std::endl;
-    std::cout << "3. 'b': 기준 프레임 캡처" << std::endl;
-    std::cout << "4. 'd_on' / 'd_off': 감지 시 서보 동작 ON/OFF" << std::endl;
-    std::cout << "5. '[' / ']': 임계값 10% 감소/증가" << std::endl;
-    std::cout << "6. 숫자 입력: 임계값 직접 설정" << std::endl;
-    std::cout << "7. 'e': 서보 모터 전체 ON/OFF" << std::endl;
-    std::cout << "8. 'c': 서보 모터 설정" << std::endl;
-    std::cout << "9. 'v': 서보 상태 확인" << std::endl;
-    std::cout << "10. 's': 통계 보기" << std::endl;
-    std::cout << "11. 'q': 종료" << std::endl;
+
+    // ROI 설정 프롬프트
+    std::cout << "ROI를 설정하시겠습니까? (y/n): ";
+    std::string roiChoice;
+    std::getline(std::cin, roiChoice);
+
+    if (roiChoice == "y" || roiChoice == "Y")
+    {
+        setupROIFromCoordinates();
+    }
+    else
+    {
+        std::cout << "ROI 설정을 건너뜁니다. 'r' 키를 입력하여 나중에 설정할 수 있습니다." << std::endl;
+    }
+
+    std::cout << "\n=== 사용 방법 ===" << std::endl;
+    std::cout << "1. 'r': ROI 좌표 입력" << std::endl;
+    std::cout << "2. 'b': 기준 프레임 캡처" << std::endl;
+    std::cout << "3. 'd_on' / 'd_off': 감지 시 서보 동작 ON/OFF" << std::endl;
+    std::cout << "4. '[' / ']': 임계값 10% 감소/증가" << std::endl;
+    std::cout << "5. 숫자 입력: 임계값 직접 설정" << std::endl;
+    std::cout << "6. 'e': 서보 모터 전체 ON/OFF" << std::endl;
+    std::cout << "7. 'c': 서보 모터 설정" << std::endl;
+    std::cout << "8. 'v': 서보 상태 확인" << std::endl;
+    std::cout << "9. 's': 통계 보기" << std::endl;
+    std::cout << "10. 'q': 종료" << std::endl;
     std::cout << "==================\n"
               << std::endl;
 
-    cv::namedWindow("Camera Feed", cv::WINDOW_AUTOSIZE);
-    cv::setMouseCallback("Camera Feed", onMouse, NULL);
+    // OpenCV GUI 함수 제거 (헤드리스 모드)
+    // cv::namedWindow("Camera Feed", cv::WINDOW_AUTOSIZE);
+    // cv::setMouseCallback("Camera Feed", onMouse, NULL);
 
     // 입력 스레드 시작
     std::thread inputThread(inputHandler);
@@ -502,6 +761,7 @@ int main()
     cv::Mat frame, grayFrame, blurredFrame, displayFrame;
     int errorCount = 0;
     const int MAX_ERRORS = 10;
+    int frameProcessedCount = 0;
 
     while (!g_shouldExit)
     {
@@ -543,22 +803,10 @@ int main()
         if (!g_roiSelected)
         {
             // ROI 선택 모드
-            if (g_drawing && g_points.size() > 0)
-            {
-                std::vector<cv::Point> displayPoints;
-                for (const auto &pt : g_points)
-                {
-                    displayPoints.push_back(cv::Point(pt.x * 640 / CAPTURE_WIDTH,
-                                                      pt.y * 480 / CAPTURE_HEIGHT));
-                }
-
-                for (size_t i = 0; i < displayPoints.size() - 1; ++i)
-                {
-                    cv::line(displayFrame, displayPoints[i], displayPoints[i + 1], cv::Scalar(255), 2);
-                }
-            }
-            cv::putText(displayFrame, "Click points, right-click to close ROI",
+            cv::putText(displayFrame, "Press 'r' to setup ROI",
                         cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255), 2);
+            cv::putText(displayFrame, "RTSP Stream Active",
+                        cv::Point(10, 60), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(200), 1);
         }
         else
         {
@@ -604,23 +852,7 @@ int main()
                 }
 
                 // Detection Controller를 통한 병 감지
-                bool shouldTrigger = g_detectionController->shouldTriggerServo(g_currentSAD);
-
-                // DetectionController가 모든 감지, 상태 변경, 쿨다운, 재시동을 처리합니다.
                 g_detectionController->shouldTriggerServo(g_currentSAD);
-
-                // if (!g_isBottlePresent && g_currentSAD > threshold) {
-                //     g_isBottlePresent = true;
-                //     g_framesSinceDetection = 0;
-                //     pushBottle();
-                // } else if (g_isBottlePresent) {
-                //     g_framesSinceDetection++;
-                //     if (g_framesSinceDetection > DEBOUNCE_FRAMES && g_currentSAD < threshold * 0.6) {
-                //         g_isBottlePresent = false;
-                //         g_detectionController->reportPass();
-                //         std::cout << "병 통과 완료" << std::endl;
-                //     }
-                // }
 
                 // 정보 표시
                 double threshold = g_detectionController->getThreshold();
@@ -646,16 +878,7 @@ int main()
                 cv::rectangle(displayFrame, cv::Point(10, 45),
                               cv::Point(210, 55), cv::Scalar(255), 1);
 
-                // if (g_isBottlePresent)
-                // {
-                //     cv::putText(displayFrame, "DETECTED!", cv::Point(10, 85),
-                //                 cv::FONT_HERSHEY_SIMPLEX, 1.2, cv::Scalar(255), 3);
-                //     cv::rectangle(displayFrame, cv::Point(5, 5),
-                //                   cv::Point(635, 475), cv::Scalar(255), 5);
-                // }
-
                 // 감지 시 시각적 피드백
-                // 'g_isBottlePresent' 대신 Controller의 현재 상태를 사용해 화면에 표시합니다.
                 DetectionState currentState = g_detectionController->getState();
                 if (currentState == DetectionState::TRIGGERED || currentState == DetectionState::COOLDOWN)
                 {
@@ -675,44 +898,82 @@ int main()
         // 그레이스케일을 3채널로 변환하여 컬러 표시
         cv::Mat displayColor;
         cv::cvtColor(displayFrame, displayColor, cv::COLOR_GRAY2BGR);
-        cv::imshow("Camera Feed", displayColor);
 
-        char key = cv::waitKey(1) & 0xFF;
-        if (key == 'q' || key == 27)
+        // OpenCV 창 표시 제거 (헤드리스 모드)
+        // cv::imshow("Camera Feed", displayColor);
+
+        // RTSP 스트림용 프레임 업데이트
         {
-            g_shouldExit = true;
-            break;
+            std::lock_guard<std::mutex> lock(g_rtspMutex);
+            g_rtspFrame = displayColor.clone();
         }
-        else if (key == 'b' && g_roiSelected)
+
+        // 주기적으로 상태 출력 (100프레임마다)
+        if (++frameProcessedCount % 100 == 0)
         {
-            captureBaseline();
+            std::cout << "[STATUS] Frames: " << frameProcessedCount
+                      << " | FPS: " << g_fps
+                      << " | ROI: " << (g_roiSelected ? "Set" : "Not set")
+                      << " | RTSP clients can connect to rtsp://192.168.0.64:8554/process3" << std::endl;
         }
-        else if (key == '[')
-        {
-            double current = g_detectionController->getThreshold();
-            g_detectionController->setThreshold(current * 0.9);
-            std::cout << "임계값 감소: " << g_detectionController->getThreshold() << std::endl;
-        }
-        else if (key == ']')
-        {
-            double current = g_detectionController->getThreshold();
-            g_detectionController->setThreshold(current * 1.1);
-            std::cout << "임계값 증가: " << g_detectionController->getThreshold() << std::endl;
-        }
-        else if (key == 'e')
-        {
-            g_servoEnabled = !g_servoEnabled;
-            std::cout << "서보 모터: " << (g_servoEnabled ? "활성화" : "비활성화") << std::endl;
-        }
-        else if (key == 'v')
-        {
-            std::cout << "\n"
-                      << readServoStatus() << std::endl;
-        }
+
+        // 키 입력 처리 제거 (터미널 입력으로 대체)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        // char key = cv::waitKey(1) & 0xFF;
+        // if (key == 'q' || key == 27)
+        // {
+        //     g_shouldExit = true;
+        //     break;
+        // }
+        // else if (key == 'b' && g_roiSelected)
+        // {
+        //     captureBaseline();
+        // }
+        // else if (key == '[')
+        // {
+        //     double current = g_detectionController->getThreshold();
+        //     g_detectionController->setThreshold(current * 0.9);
+        //     std::cout << "임계값 감소: " << g_detectionController->getThreshold() << std::endl;
+        // }
+        // else if (key == ']')
+        // {
+        //     double current = g_detectionController->getThreshold();
+        //     g_detectionController->setThreshold(current * 1.1);
+        //     std::cout << "임계값 증가: " << g_detectionController->getThreshold() << std::endl;
+        // }
+        // else if (key == 'e')
+        // {
+        //     g_servoEnabled = !g_servoEnabled;
+        //     std::cout << "서보 모터: " << (g_servoEnabled ? "활성화" : "비활성화") << std::endl;
+        // }
+        // else if (key == 'v')
+        // {
+        //     std::cout << "\n"
+        //               << readServoStatus() << std::endl;
+        // }
     }
 
     // 정리
     g_shouldExit = true;
+    g_rtspRunning = false;
+
+    // RTSP 스레드 종료
+    if (rtsp_thread.joinable())
+    {
+        std::cout << "RTSP 스트리밍 스레드 종료 중..." << std::endl;
+        rtsp_thread.join();
+    }
+
+    // GStreamer 메인 루프 종료
+    if (g_rtspLoop)
+    {
+        g_main_loop_quit(g_rtspLoop);
+        if (gst_thread.joinable())
+        {
+            gst_thread.join();
+        }
+        g_main_loop_unref(g_rtspLoop);
+    }
 
     // 최종 통계 출력
     auto stats = g_detectionController->getStats();
