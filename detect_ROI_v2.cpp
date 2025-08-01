@@ -449,7 +449,7 @@ int main()
     else
     {
         // 기본 서보 설정
-        configureServo(180, 0, 700);
+        configureServo(180, 0, 300);
     }
 
     // 카메라 파이프라인 설정

@@ -105,29 +105,38 @@ bool DetectionController::processCommand(const std::string& command) {
     return false;
 }
 
+// detection_controller.cpp 파일
+
 bool DetectionController::shouldTriggerServo(double sadValue) {
     updateStats(sadValue);
-    
-    // 상태 확인
+
+    // ========================>   수정된 부분 시작   <========================
+    // 쿨다운 상태인지 확인하고, 시간이 만료되었으면 자동으로 ARMED 상태로 복귀시킵니다.
+    // 이 로직은 reportPass()를 외부에서 호출할 필요를 없애줍니다.
+    if (state_ == DetectionState::COOLDOWN) {
+        if (std::chrono::system_clock::now() >= cooldownEndTime_) {
+            setState(DetectionState::ARMED);
+            pushEvent({DetectionEvent::BOTTLE_PASSED, std::chrono::system_clock::now(),
+                      0, threshold_, "Cooldown finished, system re-armed"});
+        }
+    }
+    // ========================>    수정된 부분 끝    <========================
+
+    // ARMED 상태가 아니면(COOLDOWN 포함) 서보를 동작시키지 않습니다.
     if (state_ != DetectionState::ARMED) {
         return false;
     }
-    
-    // 쿨다운 확인
-    if (isInCooldown()) {
-        return false;
-    }
-    
+
     // 임계값 확인
     if (sadValue <= threshold_) {
         return false;
     }
-    
+
     // 감지 트리거
     setState(DetectionState::TRIGGERED);
     lastTriggerTime_ = std::chrono::system_clock::now();
     cooldownEndTime_ = lastTriggerTime_ + std::chrono::milliseconds(cooldownMs_);
-    
+
     {
         std::lock_guard<std::mutex> lock(statsMutex_);
         stats_.totalDetections++;
@@ -136,18 +145,18 @@ bool DetectionController::shouldTriggerServo(double sadValue) {
             stats_.servoActions++;
         }
     }
-    
-    pushEvent({DetectionEvent::BOTTLE_DETECTED, lastTriggerTime_, 
+
+    pushEvent({DetectionEvent::BOTTLE_DETECTED, lastTriggerTime_,
               sadValue, threshold_, "Bottle detected - trigger servo"});
-    
+
     if (autoServoAction_) {
-        pushEvent({DetectionEvent::SERVO_ACTION, lastTriggerTime_, 
+        pushEvent({DetectionEvent::SERVO_ACTION, lastTriggerTime_,
                   sadValue, threshold_, "Servo action triggered"});
     }
-    
+
     // 쿨다운 상태로 전환
     setState(DetectionState::COOLDOWN);
-    
+
     return autoServoAction_;
 }
 
